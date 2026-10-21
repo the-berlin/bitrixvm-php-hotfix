@@ -27,7 +27,8 @@ readonly TARBALL=php-$TARGET.tar.xz
 readonly TARBALL_URL=https://www.php.net/distributions/$TARBALL
 readonly TARBALL_SHA256=5737b98601fe5ab1b8c5db0c82ed3158acb9283ed3081ffe2faffb9ac81455e6
 readonly WORK=${WORK:-/root/php-build}
-readonly SRC=$WORK/php-$TARGET
+readonly SRC=$WORK/php-$TARGET          # сборка модуля Apache и модулей расширений
+readonly SRC_CLI=$WORK/php-$TARGET-cli  # сборка консольного php и php-cgi
 readonly STATE=$WORK/state
 readonly BACKUP=$STATE/php-files-before-$TARGET.tgz
 readonly PREVIEW=$STATE/ext-preview
@@ -52,6 +53,16 @@ readonly REMI_BASE_OPTS=(
   --without-gdbm --with-openssl --with-system-ciphers --with-external-pcre
   --with-external-libcrypt --with-zlib --with-layout=GNU --with-kerberos --with-libxml
   --with-mhash --without-password-argon2 --disable-phpdbg
+)
+# Выключение модулей, которые Remi собирает отдельными .so (снято с того же php-devel-8.2.34).
+# Консольный php собирается с ним: модули расширений берутся из сборки Apache.
+readonly REMI_WITHOUT_SHARED=(
+  --without-mysqli --disable-pdo --disable-gd --disable-dom --disable-dba --without-unixODBC
+  --disable-opcache --without-ffi --disable-xmlreader --disable-xmlwriter --without-sodium
+  --without-sqlite3 --disable-phar --disable-fileinfo --without-pspell --without-curl
+  --disable-posix --disable-xml --disable-simplexml --disable-exif --without-gettext
+  --without-iconv --disable-ftp --without-bz2 --disable-ctype --disable-shmop --disable-sockets
+  --disable-tokenizer --disable-sysvmsg --disable-sysvshm --disable-sysvsem
 )
 readonly BASE_DEVEL=(
   gcc gcc-c++ make pkgconf-pkg-config httpd-devel
@@ -200,8 +211,8 @@ guard_src_busy() {
     comm=$(cat "$p/comm" 2>/dev/null) || continue
     case $comm in make|gmake|configure|cc1|cc1plus|gcc|g++|cc|ld|as|libtool) ;; *) continue ;; esac
     cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
-    if [[ $cwd == "$SRC" || $cwd == "$SRC"/* ]]; then
-      die "в $SRC уже идёт $comm (PID ${p#/proc/}) — дождитесь окончания и запустите скрипт снова"
+    if [[ $cwd == "$SRC" || $cwd == "$SRC"/* || $cwd == "$SRC_CLI" || $cwd == "$SRC_CLI"/* ]]; then
+      die "в $cwd уже идёт $comm (PID ${p#/proc/}) — дождитесь окончания и запустите скрипт снова"
     fi
   done
 }
@@ -323,9 +334,15 @@ fetch_source() {
     (cd "$WORK" && echo "$TARBALL_SHA256  $TARBALL" | sha256sum -c -) || die "контрольная сумма архива не сходится"
   fi
   if [[ -f $SRC/configure && -f $SRC/main/php_version.h ]]; then
-    info "исходники уже распакованы"
+    info "исходники для сборки Apache уже распакованы"
   else
     tar -xf "$WORK/$TARBALL" -C "$WORK"
+  fi
+  if [[ -f $SRC_CLI/configure && -f $SRC_CLI/main/php_version.h ]]; then
+    info "исходники для консольной сборки уже распакованы"
+  else
+    mkdir -p "$SRC_CLI"
+    tar -xf "$WORK/$TARBALL" -C "$SRC_CLI" --strip-components=1
   fi
 }
 
@@ -345,11 +362,27 @@ collect_modules() {
   (( ${#BUILD_MODS[@]} )) || die "в $EXT_DIR не нашёл модулей из пакетов PHP"
   info "соберу модули (${#BUILD_MODS[@]}): ${BUILD_MODS[*]}"
   (( ${#SKIP_MODS[@]} == 0 )) || warn "не умею собирать и оставляю $CUR: ${SKIP_MODS[*]}"
+
+  # Модули, вкомпилированные в консольный php (у Remi так собраны pcntl и readline).
+  CLI_STATIC=() CLI_DEVEL=()
+  if [[ -s $STATE/baseline-modules.txt ]]; then
+    if grep -qx pcntl "$STATE/baseline-modules.txt" && [[ -z ${PRESENT[pcntl]:-} ]]; then
+      CLI_STATIC+=(--enable-pcntl)
+    fi
+    if grep -qx readline "$STATE/baseline-modules.txt" && [[ -z ${PRESENT[readline]:-} ]]; then
+      if ldd /usr/bin/php 2>/dev/null | grep 'libreadline' >/dev/null; then
+        CLI_STATIC+=(--with-readline); CLI_DEVEL+=(readline-devel)
+      else
+        CLI_STATIC+=(--with-libedit); CLI_DEVEL+=(libedit-devel)
+      fi
+    fi
+  fi
+  (( ${#CLI_STATIC[@]} == 0 )) || info "в консольный php вкомпилирую: ${CLI_STATIC[*]}"
 }
 
 install_build_deps() {
   say "Пакеты для сборки"
-  local -a pkgs=("${BASE_DEVEL[@]}")
+  local -a pkgs=("${BASE_DEVEL[@]}" "${CLI_DEVEL[@]}")
   local mod
   for mod in "${BUILD_MODS[@]}"; do
     # shellcheck disable=SC2206
@@ -393,55 +426,73 @@ configure_args() {
   )
 }
 
+# Как у Remi, сборок две. В сборке вместе с модулем Apache PHP не включает то, что доступно
+# только консоли: функцию chroot() и модули pcntl и readline. Поэтому консольный php и php-cgi
+# собираются отдельно, без модуля Apache; модули расширений берутся из сборки Apache.
 configure_source() {
   say "Конфигурация сборки"
   configure_args
-  printf '%s\n' "${CONF_ENV[@]}" "${CONF_ARGS[@]}" > "$STATE/configure.args.want"
-  if [[ $RECONFIGURE == 0 && -x $SRC/config.status && -f $STATE/configure.args ]] \
-     && cmp -s "$STATE/configure.args" "$STATE/configure.args.want"; then
-    info "сборка уже сконфигурирована с теми же параметрами"
+  if [[ -f $STATE/configure.args && ! -f $STATE/configure-apache.args ]]; then
+    mv -f "$STATE/configure.args" "$STATE/configure-apache.args"
+  fi
+  configure_dir "$SRC" apache "${CONF_ARGS[@]}"
+  configure_dir "$SRC_CLI" cli "${REMI_BASE_OPTS[@]}" "${REMI_WITHOUT_SHARED[@]}" "${CLI_STATIC[@]}"
+}
+
+configure_dir() { # $1 — каталог исходников, $2 — имя сборки, дальше — параметры configure
+  local dir=$1 name=$2
+  shift 2
+  local stamp=$STATE/configure-$name.args log=$STATE/configure-$name.log
+  printf '%s\n' "${CONF_ENV[@]}" "$@" > "$stamp.want"
+  if [[ $RECONFIGURE == 0 && -x $dir/config.status && -f $stamp ]] && cmp -s "$stamp" "$stamp.want"; then
+    info "$name: уже сконфигурировано с теми же параметрами"
     return
   fi
-  cd "$SRC"
+  cd "$dir"
   if [[ -f Makefile ]]; then make distclean >/dev/null 2>&1 || true; fi
-  rm -f "$STATE/configure.args"
-  info "configure: лог $STATE/configure.log"
-  if ! env "${CONF_ENV[@]}" ./configure "${CONF_ARGS[@]}" > "$STATE/configure.log" 2>&1; then
-    tail -n 20 "$STATE/configure.log" >&2
-    die "configure остановился. Поставьте недостающий пакет (dnf install --disablerepo='remi*' <имя>-devel) и запустите скрипт снова"
+  rm -f "$stamp"
+  info "$name: configure, лог $log"
+  if ! env "${CONF_ENV[@]}" ./configure "$@" > "$log" 2>&1; then
+    tail -n 20 "$log" >&2
+    die "configure ($name) остановился. Поставьте недостающий пакет (dnf install --disablerepo='remi*' <имя>-devel) и запустите скрипт снова"
   fi
   grep -qE "^#define PHP_EXTENSION_DIR[[:space:]]+\"$EXT_DIR\"" main/build-defs.h \
-    || die "сборка ищет модули не в $EXT_DIR"
-  mv -f "$STATE/configure.args.want" "$STATE/configure.args"
+    || die "сборка $name ищет модули не в $EXT_DIR"
+  mv -f "$stamp.want" "$stamp"
   cd /
 }
 
 compile() {
   say "Сборка"
-  info "идёт make, ход можно смотреть: tail -f $STATE/make.log"
-  cd "$SRC"
-  if ! nice -n 10 make -j"$(nproc)" > "$STATE/make.log" 2>&1; then
-    tail -n 30 "$STATE/make.log" >&2
-    die "make упал, полный лог: $STATE/make.log"
-  fi
-  cd /
-  local f mod
-  for f in libs/libphp.so sapi/cli/php; do
-    [[ -s $SRC/$f ]] || die "после сборки нет $f"
-  done
+  make_dir "$SRC" apache
+  make_dir "$SRC_CLI" cli
+  [[ -s $SRC/libs/libphp.so ]] || die "после сборки нет модуля Apache libs/libphp.so"
+  [[ -s $SRC_CLI/sapi/cli/php ]] || die "после сборки нет консольного sapi/cli/php"
+  local mod
   for mod in "${BUILD_MODS[@]}"; do
     [[ -s $SRC/modules/$mod.so ]] || die "после сборки нет модуля $mod.so"
   done
   info "собрано"
 }
 
+make_dir() { # $1 — каталог исходников, $2 — имя сборки
+  local dir=$1 name=$2 log=$STATE/make-$2.log
+  info "$name: идёт make, ход можно смотреть: tail -f $log"
+  cd "$dir"
+  if ! nice -n 10 make -j"$(nproc)" > "$log" 2>&1; then
+    tail -n 30 "$log" >&2
+    die "make ($name) упал, полный лог: $log"
+  fi
+  cd /
+}
+
 # Снимок новой сборки так, как он будет после подмены: прежние модули PECL + новые встроенные.
 check_build() {
   say "Проверка сборки до подмены"
   local v e mod
-  v=$("$SRC/sapi/cli/php" -n -r 'echo PHP_VERSION;')
+  v=$("$SRC_CLI/sapi/cli/php" -n -r 'echo PHP_VERSION;')
   [[ $v == "$TARGET" ]] || die "собранный php сообщает версию $v"
-  e=$("$SRC/sapi/cli/php" -n -r 'echo PHP_EXTENSION_DIR;')
+  e=$("$SRC_CLI/sapi/cli/php" -n -r 'echo PHP_EXTENSION_DIR;')
   [[ $e == "$EXT_DIR" ]] || die "собранный php ищет модули в $e, а нужно $EXT_DIR"
 
   rm -rf "$PREVIEW"
@@ -449,7 +500,7 @@ check_build() {
   for e in "$EXT_DIR"/*.so; do ln -s "$e" "$PREVIEW/${e##*/}"; done
   for mod in "${BUILD_MODS[@]}"; do ln -sfn "$SRC/modules/$mod.so" "$PREVIEW/$mod.so"; done
 
-  compare_cli "$SRC/sapi/cli/php" -d "extension_dir=$PREVIEW"
+  compare_cli "$SRC_CLI/sapi/cli/php" -d "extension_dir=$PREVIEW"
   info "версия $TARGET, каталог модулей $EXT_DIR, функции, классы и ini совпадают с $CUR"
 }
 
@@ -473,8 +524,9 @@ compare_cli() {
     cmp -s "$STATE/baseline-cli.json" "$STATE/new-cli.json" && return
   fi
 
-  warn "новая сборка отличается от $CUR:"
-  diff -u "$STATE/baseline-cli.json" "$STATE/new-cli.json" | tail -n +3 | head -n 60 >&2 || true
+  diff -u "$STATE/baseline-cli.json" "$STATE/new-cli.json" > "$STATE/diff-cli.txt" || true
+  warn "новая сборка отличается от $CUR (полностью — $STATE/diff-cli.txt):"
+  tail -n +3 "$STATE/diff-cli.txt" | head -n 150 >&2 || true
   [[ $FORCE == 1 ]] && { warn "--force: продолжаю несмотря на разницу"; return; }
   die "подмена остановлена. Разберите разницу выше; продолжить всё равно — ключ --force"
 }
@@ -495,10 +547,10 @@ backup_once() {
 }
 
 plan_swaps() {
-  SWAP_SRC=("$SRC/libs/libphp.so" "$SRC/sapi/cli/php")
+  SWAP_SRC=("$SRC/libs/libphp.so" "$SRC_CLI/sapi/cli/php")
   SWAP_DST=("$LIBPHP" /usr/bin/php)
-  if [[ -x /usr/bin/php-cgi && -s $SRC/sapi/cgi/php-cgi ]]; then
-    SWAP_SRC+=("$SRC/sapi/cgi/php-cgi"); SWAP_DST+=(/usr/bin/php-cgi)
+  if [[ -x /usr/bin/php-cgi && -s $SRC_CLI/sapi/cgi/php-cgi ]]; then
+    SWAP_SRC+=("$SRC_CLI/sapi/cgi/php-cgi"); SWAP_DST+=(/usr/bin/php-cgi)
   elif [[ -x /usr/bin/php-cgi ]]; then
     warn "php-cgi не собрался — /usr/bin/php-cgi останется $CUR (Apache его не использует)"
   fi
