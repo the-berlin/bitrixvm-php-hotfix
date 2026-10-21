@@ -643,7 +643,15 @@ verify() {
   web=$(web_version)
   info "консоль: $cli"
   info "Apache:  $web"
-  [[ $cli == "$TARGET" ]] || { warn "консольный php не $TARGET"; ok=0; }
+  if [[ $cli != "$TARGET" ]]; then
+    warn "консольный php не $TARGET"
+    ok=0
+    # База пакетов считает, что стоит прежняя версия: переустановка пакетов молча возвращает её файлы.
+    if [[ -f $STATE/backup.version && $cli == "$(cat "$STATE/backup.version")" ]]; then
+      warn "PHP вернулся к $cli: файлы перезаписаны пакетами (dnf reinstall или «починка» PHP из меню BitrixVM)"
+      warn "это снова уязвимая версия. Запустите: bash $0 build — собирать заново не придётся, будет только подмена"
+    fi
+  fi
   if [[ $web == "?" ]]; then
     warn "версию через Apache снять не удалось (пробовал: $(apache_urls | awk '!seen[$0]++' | paste -sd' ' -); $DOCROOT)"
     warn "адрес сайта на Apache можно задать явно: APACHE_URL=http://127.0.0.1:<порт> bash $0 verify"
@@ -684,6 +692,10 @@ verify() {
   info "меню BitrixVM («Update PHP, MySQL, PostgreSQL») может не сразу показать $TARGET:"
   info "пакеты в системе остаются прежними. Фактическую версию показывают php -v, режим verify"
   info "и административный раздел Битрикс"
+  warn "до установки пакета $TARGET из Remi не переустанавливайте php-пакеты — ни через dnf, ни «починкой»"
+  warn "из меню BitrixVM: база пакетов считает, что стоит прежняя версия, и молча вернёт уязвимые файлы"
+  info "rpm -V по php-пакетам показывает изменённые файлы — это ожидаемо, «восстанавливать» их не нужно"
+  info "после любого обслуживания машины запускайте: bash $0 verify — он покажет откат версии"
 }
 
 mode_build() {
