@@ -126,10 +126,23 @@ ASSUME_YES=0
 RECONFIGURE=0
 FORCE=0
 
-say()  { printf '\n==> %s\n' "$*"; }
+# Цвет — только в терминале; в журнал он не попадает. Отключить: NO_COLOR=1.
+C_HEAD= C_OK= C_WARN= C_ERR= C_ADD= C_DEL= C_HUNK= C_OFF=
+setup_colors() {
+  [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]] || return 0
+  C_HEAD=$'\e[1;36m' C_OK=$'\e[1;32m' C_WARN=$'\e[1;33m' C_ERR=$'\e[1;31m'
+  C_ADD=$'\e[32m' C_DEL=$'\e[31m' C_HUNK=$'\e[36m' C_OFF=$'\e[0m'
+}
+
+say()  { printf '\n%s==> %s%s\n' "$C_HEAD" "$*" "$C_OFF"; }
+ok()   { printf '\n%s==> %s%s\n' "$C_OK" "$*" "$C_OFF"; }
 info() { printf '    %s\n' "$*"; }
-warn() { printf '!!  %s\n' "$*" >&2; }
-die()  { printf '\nОШИБКА: %s\n' "$*" >&2; exit 1; }
+warn() { printf '%s!!  %s%s\n' "$C_WARN" "$*" "$C_OFF" >&2; }
+die()  { printf '\n%sОШИБКА: %s%s\n' "$C_ERR" "$*" "$C_OFF" >&2; exit 1; }
+colorize_diff() {
+  awk -v a="$C_ADD" -v d="$C_DEL" -v h="$C_HUNK" -v o="$C_OFF" \
+    '/^@@/ {print h $0 o; next} /^\+/ {print a $0 o; next} /^-/ {print d $0 o; next} {print}'
+}
 trap 'warn "строка $LINENO: команда завершилась с ошибкой: $BASH_COMMAND"' ERR
 
 usage() {
@@ -236,7 +249,9 @@ $c = get_declared_classes();
 sort($c);
 $o['classes'] = $c;
 $i = ini_get_all(null, false);
-unset($i['extension_dir'], $i['session.upload_progress.enabled']);
+// extension_dir при проверке до подмены указывает на временный каталог; временную меру ставит скрипт;
+// memory_hard_limit_percent — новая настройка 8.2.35, часть исправления CVE-2026-109618.
+unset($i['extension_dir'], $i['session.upload_progress.enabled'], $i['memory_hard_limit_percent']);
 ksort($i);
 $o['ini'] = $i;
 if (function_exists('gd_info')) {
@@ -504,6 +519,8 @@ check_build() {
 
   compare_cli "$SRC_CLI/sapi/cli/php" -d "extension_dir=$PREVIEW"
   info "версия $TARGET, каталог модулей $EXT_DIR, функции, классы и ini совпадают с $CUR"
+  info "ожидаемое отличие $TARGET в сравнение не входит: новая настройка memory_hard_limit_percent"
+  info "(жёсткий предел памяти — часть исправления CVE-2026-109618)"
 }
 
 # Сравнить снимок php с сохранённым. Разницу в ini по умолчанию закрывает файлом совместимости.
@@ -528,7 +545,7 @@ compare_cli() {
 
   diff -u "$STATE/baseline-cli.json" "$STATE/new-cli.json" > "$STATE/diff-cli.txt" || true
   warn "новая сборка отличается от $CUR (полностью — $STATE/diff-cli.txt):"
-  tail -n +3 "$STATE/diff-cli.txt" | head -n 150 >&2 || true
+  tail -n +3 "$STATE/diff-cli.txt" | head -n 150 | colorize_diff >&2 || true
   [[ $FORCE == 1 ]] && { warn "--force: продолжаю несмотря на разницу"; return; }
   die "подмена остановлена. Разберите разницу выше; продолжить всё равно — ключ --force"
 }
@@ -629,7 +646,7 @@ verify() {
       info "консоль: функции, классы и ini те же, что у прежней версии"
     else
       warn "консоль отличается от прежней версии:"
-      diff -u "$STATE/baseline-cli.json" "$STATE/after-cli.json" | tail -n +3 | head -n 40 >&2 || true
+      diff -u "$STATE/baseline-cli.json" "$STATE/after-cli.json" | tail -n +3 | head -n 40 | colorize_diff >&2 || true
       ok=0
     fi
   fi
@@ -639,7 +656,7 @@ verify() {
       info "Apache: функции, классы и ini те же, что у прежней версии"
     else
       warn "Apache отличается от прежней версии:"
-      diff -u "$STATE/baseline-web.json" "$STATE/after-web.json" | tail -n +3 | head -n 40 >&2 || true
+      diff -u "$STATE/baseline-web.json" "$STATE/after-web.json" | tail -n +3 | head -n 40 | colorize_diff >&2 || true
       ok=0
     fi
   fi
@@ -650,7 +667,7 @@ verify() {
     info "временная мера $MITIGATION_INI оставлена; после проверки портала её можно удалить и перезапустить httpd"
   fi
   (( ok )) || die "проверка не пройдена — см. выше"
-  say "ГОТОВО: PHP $TARGET в консоли и в Apache, поведение совпадает с прежним"
+  ok "ГОТОВО: PHP $TARGET в консоли и в Apache, поведение совпадает с прежним"
 }
 
 mode_build() {
@@ -683,9 +700,10 @@ mode_rollback() {
 
 main() {
   parse_args "$@"
+  setup_colors
   cd /
   mkdir -p "$STATE"
-  exec > >(tee -a "$STATE/hotfix.log") 2>&1
+  exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$STATE/hotfix.log")) 2>&1
   printf '\n######## %s  %s %s\n' "$(date -u +%FT%TZ)" "$0" "$*"
   take_lock
   trap 'rm -f "$DOCROOT"/php-hotfix-probe-$$-*.php' EXIT
