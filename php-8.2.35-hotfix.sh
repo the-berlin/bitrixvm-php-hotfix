@@ -280,26 +280,38 @@ probe_cli() { # $1 — php, остальное — его ключи
   "$bin" "$@" "$STATE/probe.php" 2>&1 | sed '/"version":/d'
 }
 
-apache_url() {
+# Адреса Apache для проверки: заданный APACHE_URL, затем найденный в прошлый раз, затем все порты httpd.
+# В BitrixVM Apache слушает несколько портов, и сайт отдаёт не первый из них.
+apache_urls() {
+  if [[ -n ${APACHE_URL:-} ]]; then
+    printf '%s\n' "$APACHE_URL"
+    return 0
+  fi
+  if [[ -s $STATE/apache-url ]]; then cat "$STATE/apache-url"; fi
   local hp
-  hp=$(ss -ltnpH 2>/dev/null | awk '/"httpd"/ {print $4}' | sort -u | grep -m1 -E '^127\.0\.0\.1:' || true)
-  [[ -n $hp ]] || hp=$(ss -ltnpH 2>/dev/null | awk '/"httpd"/ {print $4}' | head -n1 || true)
-  [[ -n $hp ]] || return 1
-  hp=${hp/#\*:/127.0.0.1:}
-  hp=${hp/#0.0.0.0:/127.0.0.1:}
-  hp=${hp/#\[::\]:/127.0.0.1:}
-  printf 'http://%s' "$hp"
+  ss -ltnpH 2>/dev/null | awk '/"httpd"/ {print $4}' | sort -u | while read -r hp; do
+    hp=${hp/#\*:/127.0.0.1:}
+    hp=${hp/#0.0.0.0:/127.0.0.1:}
+    hp=${hp/#\[::\]:/127.0.0.1:}
+    printf 'http://%s\n' "$hp"
+  done
+  return 0
 }
 
 probe_web() { # снимок через Apache; пустой вывод — снять не удалось
-  local base name out
-  base=$(apache_url) || return 0
   [[ -d $DOCROOT ]] || return 0
+  local name out url
   name=php-hotfix-probe-$$-$RANDOM.php
   install -m 644 "$STATE/probe.php" "$DOCROOT/$name"
-  out=$(curl -s --max-time 20 "$base/$name" || true)
+  while read -r url; do
+    out=$(curl -s --max-time 20 "$url/$name" || true)
+    if [[ $out == *'"ext":'* ]]; then
+      printf '%s\n' "$url" > "$STATE/apache-url"
+      printf '%s\n' "$out"
+      break
+    fi
+  done < <(apache_urls | awk '!seen[$0]++')
   rm -f "$DOCROOT/$name"
-  [[ $out == *'"ext":'* ]] && printf '%s\n' "$out"
   return 0
 }
 
@@ -322,7 +334,7 @@ take_baseline() {
   probe_cli php > "$STATE/baseline-cli.json"
   probe_web | sed '/"version":/d' > "$STATE/baseline-web.json"
   php -m > "$STATE/baseline-modules.txt"
-  [[ -s $STATE/baseline-web.json ]] || warn "снимок через Apache снять не удалось ($(apache_url || echo 'нет адреса'), $DOCROOT)"
+  [[ -s $STATE/baseline-web.json ]] || warn "снимок через Apache снять не удалось (пробовал: $(apache_urls | awk '!seen[$0]++' | paste -sd' ' -); $DOCROOT)"
   info "снимок PHP $CUR сохранён: функции, классы и ini каждого модуля"
 }
 
@@ -633,7 +645,8 @@ verify() {
   info "Apache:  $web"
   [[ $cli == "$TARGET" ]] || { warn "консольный php не $TARGET"; ok=0; }
   if [[ $web == "?" ]]; then
-    warn "версию через Apache снять не удалось ($(apache_url || echo 'не найден порт httpd'), $DOCROOT) — проверьте вручную"
+    warn "версию через Apache снять не удалось (пробовал: $(apache_urls | awk '!seen[$0]++' | paste -sd' ' -); $DOCROOT)"
+    warn "адрес сайта на Apache можно задать явно: APACHE_URL=http://127.0.0.1:<порт> bash $0 verify"
     ok=0
   elif [[ $web != "$TARGET" ]]; then
     warn "Apache отдаёт $web — перезапустите httpd"
