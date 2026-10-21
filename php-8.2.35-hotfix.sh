@@ -56,8 +56,10 @@ readonly REMI_BASE_OPTS=(
 )
 # Выключение модулей, которые Remi собирает отдельными .so (снято с того же php-devel-8.2.34).
 # Консольный php собирается с ним: модули расширений берутся из сборки Apache.
+# --without-pdo-sqlite добавлен: configure 8.2.35 проверяет pdo_sqlite раньше pdo, и без явного
+# выключения pdo_sqlite включается без PDO — сборка падает на компоновке.
 readonly REMI_WITHOUT_SHARED=(
-  --without-mysqli --disable-pdo --disable-gd --disable-dom --disable-dba --without-unixODBC
+  --without-mysqli --disable-pdo --without-pdo-sqlite --disable-gd --disable-dom --disable-dba --without-unixODBC
   --disable-opcache --without-ffi --disable-xmlreader --disable-xmlwriter --without-sodium
   --without-sqlite3 --disable-phar --disable-fileinfo --without-pspell --without-curl
   --disable-posix --disable-xml --disable-simplexml --disable-exif --without-gettext
